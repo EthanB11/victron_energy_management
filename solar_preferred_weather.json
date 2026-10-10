@@ -1,0 +1,472 @@
+[
+    {
+        "id": "weather_aware_alarm_flow",
+        "type": "tab",
+        "label": "Automated Shore Power & Grid Alarm",
+        "disabled": false,
+        "info": "Controls System Mode and silences false Grid Lost Alarms dynamically based on battery parameters."
+    },
+    {
+        "id": "weather_api_subflow",
+        "type": "tab",
+        "label": "Weather Core Engine",
+        "disabled": false,
+        "info": "Queries OpenWeatherMap every morning and dynamically calculates the charging SoC floor."
+    },
+    {
+        "id": "victron-client-id",
+        "type": "victron-client",
+        "showValues": true,
+        "contextStore": true,
+        "enablePolling": false
+    },
+    {
+        "id": "victron_soc_in_2",
+        "type": "victron-input-battery",
+        "z": "weather_aware_alarm_flow",
+        "outputs": 1,
+        "service": "com.victronenergy.battery/277",
+        "path": "/Soc",
+        "serviceObj": {
+            "service": "com.victronenergy.battery/277",
+            "name": "BMV-712 Smart",
+            "communityTag": "battery"
+        },
+        "pathObj": {
+            "path": "/Soc",
+            "type": "float",
+            "name": "State of charge (%)"
+        },
+        "name": "Battery SoC",
+        "onlyChanges": false,
+        "conditionalMode": false,
+        "condition1HysteresisEnabled": false,
+        "condition1HysteresisThreshold": "",
+        "outputTrue": "",
+        "outputFalse": "",
+        "debounce": "",
+        "x": 450,
+        "y": 900,
+        "wires": [
+            [
+                "smart_hysteresis_logic"
+            ]
+        ]
+    },
+    {
+        "id": "victron_voltage_in_2",
+        "type": "victron-input-battery",
+        "z": "weather_aware_alarm_flow",
+        "outputs": 1,
+        "service": "com.victronenergy.battery/277",
+        "path": "/Dc/0/Voltage",
+        "serviceObj": {
+            "service": "com.victronenergy.battery/277",
+            "name": "BMV-712 Smart",
+            "communityTag": "battery"
+        },
+        "pathObj": {
+            "path": "/Dc/0/Voltage",
+            "type": "float",
+            "name": "Battery voltage (V)"
+        },
+        "name": "Battery Voltage",
+        "onlyChanges": false,
+        "conditionalMode": false,
+        "condition1HysteresisEnabled": false,
+        "condition1HysteresisThreshold": "",
+        "outputTrue": "",
+        "outputFalse": "",
+        "debounce": "",
+        "x": 460,
+        "y": 960,
+        "wires": [
+            [
+                "smart_hysteresis_logic"
+            ]
+        ]
+    },
+    {
+        "id": "smart_hysteresis_logic",
+        "type": "function",
+        "z": "weather_aware_alarm_flow",
+        "name": "Advanced Logic & Alarms",
+        "func": "// ==========================================\n// 1. INITIALIZE SYSTEM MEMORY\n// ==========================================\nlet currentMode = context.get('currentMode') || 0; \nlet soc = context.get('soc') || 100;\nlet voltage = context.get('voltage') || 26.4;\nlet acLoad = context.get('acLoad') || 0;\nlet manualOverride = context.get('manualOverride') || 0;\nlet isWeatherBad = context.get('isWeatherBad') || false;\n\n// Track both solar arrays independently in local memory slots\nlet solarWatts1 = context.get('solarWatts1') || 0;\nlet solarWatts2 = context.get('solarWatts2') || 0;\n\n// ==========================================\n// 2. PARSE INCOMING DATA PIPELINES (VIC-AWARE)\n// ==========================================\nif (msg.topic) {\n    let lowerTopic = msg.topic.toLowerCase();\n    \n    if (lowerTopic.includes(\"soc\")) {\n        soc = Number(msg.payload);\n        context.set('soc', soc);\n    }\n    if (lowerTopic.includes(\"voltage\")) {\n        voltage = Number(msg.payload);\n        context.set('voltage', voltage);\n    }\n    if (lowerTopic.includes(\"ac/acout/l1/p\") || lowerTopic.includes(\"consumption\")) {\n        acLoad = Number(msg.payload);\n        context.set('acLoad', acLoad);\n    }\n    if (lowerTopic.includes(\"weather\") || lowerTopic.includes(\"cloud\") || lowerTopic.includes(\"forecast\")) {\n        if (msg.payload === \"Overcast\" || msg.payload === \"Rain\" || msg.payload > 70) { isWeatherBad = true; } \n        else { isWeatherBad = false; }\n        context.set('isWeatherBad', isWeatherBad);\n    }\n\n    // MATCH VIC-SYSTEM SOLAR CHARGERS AUTOMATIC TOPICS:\n    if (lowerTopic.includes(\"solarcharger\")) {\n        if (lowerTopic.includes(\"/0/\") || lowerTopic.includes(\"solarcharger_0\") || lowerTopic.includes(\"instance0\")) {\n            solarWatts1 = Number(msg.payload);\n            context.set('solarWatts1', solarWatts1);\n        } else {\n            solarWatts2 = Number(msg.payload);\n            context.set('solarWatts2', solarWatts2);\n        }\n    }\n}\n\n// Intercept raw switch wire movements from your Venus toggle\nif (!msg.topic || msg.topic === \"\") {\n    if (msg.payload === 1 || msg.payload === true || msg.payload === 101) { manualOverride = 1; }\n    else if (msg.payload === 0 || msg.payload === false) { manualOverride = 0; }\n    context.set('manualOverride', manualOverride);\n}\n\n// Math Aggregator: Calculate total generation and net energy balance\nlet totalSolarWatts = solarWatts1 + solarWatts2;\nlet netSolarBalance = totalSolarWatts - acLoad;\n\nlet dynamicLowerSoC = global.get(\"dynamicLowerSoC\") || 20;\nlet targetMode = currentMode; \n\n// ==========================================\n// 3. TARGET STATE CALCULATOR (Solar Watts vs Load Watts)\n// ==========================================\nif (manualOverride === 1) {\n    targetMode = 0; // Manual Overwrite ON -> Force Grid Connect Immediately\n    context.set('lastSentPayload', null); \n} else if (acLoad >= 1200) {\n    targetMode = 0; // Hard load safety ceiling -> Use Grid to protect inverter components\n} else {\n    // 1. CRITICAL BATTERY FLOOR PROTECTION\n    if (soc <= dynamicLowerSoC || voltage <= 23.8) {\n        targetMode = 0; \n    } \n    \n    // 2. CONDITIONAL SOLAR PRIORITY RUN ENGAGEMENT\n    else if (isWeatherBad === false && soc >= (dynamicLowerSoC + 4) && voltage > 24.5 && netSolarBalance >= 50) {\n        targetMode = 1; // Verified net energy surplus -> Safe to run Solar Run\n    } \n    \n    // 3. REAL-TIME DEFICIT DRIFT FALLBACK (The Net Energy Monitor)\n    else if (isWeatherBad === true || (netSolarBalance < -200 && soc < 50)) {\n        targetMode = 0; // House load out-paces solar -> Reconnect Grid cleanly\n    } \n    \n    // 4. BUFFER STATE HYSTERESIS HOLD\n    else {\n        targetMode = currentMode; \n    }\n}\n\n// ==========================================\n// 4. FORCE SHORE POWER HARDWARE CONTROL GATE\n// ==========================================\nlet lastSentPayload = context.get('lastSentPayload');\n\n// NATIVE SYSTEM REGISTERS FOR BLUE HARDWARE NODES:\n// 1 = True (Force the hardware to turn ON Shore Power Connect / Start Charging)\n// 0 = False (Turn OFF Force Shore Power / Release control back to Solar priority)\nlet outputPayload = (targetMode === 0) ? 1 : 0; \n\nif (outputPayload === lastSentPayload) {\n    return [null, null]; // Suppress duplicate loops\n}\n\ncontext.set('lastSentPayload', outputPayload);\ncurrentMode = targetMode;\ncontext.set('currentMode', currentMode);\n\nmsgMode = { payload: outputPayload, topic: \"Force Shore Control\" };\nmsgAlarm = { payload: (outputPayload === 1) ? 1 : 0 }; \n\nreturn [msgMode, msgAlarm];\n",
+        "outputs": 3,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 730,
+        "y": 920,
+        "wires": [
+            [
+                "f45fbc6e8f161bce"
+            ],
+            [
+                "rbe_filter_alarm"
+            ],
+            []
+        ]
+    },
+    {
+        "id": "rbe_filter_alarm",
+        "type": "rbe",
+        "z": "weather_aware_alarm_flow",
+        "name": "Filter Alarm",
+        "func": "rbe",
+        "gap": "",
+        "start": "",
+        "inout": "out",
+        "property": "payload",
+        "topi": "topic",
+        "x": 950,
+        "y": 960,
+        "wires": [
+            [
+                "ea020f9d09a55a1a"
+            ]
+        ]
+    },
+    {
+        "id": "ea020f9d09a55a1a",
+        "type": "victron-output-custom",
+        "z": "weather_aware_alarm_flow",
+        "outputs": 0,
+        "service": "com.victronenergy.vebus/276",
+        "path": "/Settings/Alarm/System/GridLost",
+        "serviceObj": {
+            "service": "com.victronenergy.vebus/276",
+            "name": "MultiPlus (276)"
+        },
+        "pathObj": {
+            "path": "/Settings/Alarm/System/GridLost",
+            "name": "/Settings/Alarm/System/GridLost",
+            "type": "number",
+            "value": 0
+        },
+        "name": "GridLost",
+        "onlyChanges": false,
+        "roundValues": "no",
+        "rateLimit": 0,
+        "conditionalMode": false,
+        "condition1Operator": ">",
+        "condition1HysteresisEnabled": false,
+        "condition1HysteresisThreshold": "",
+        "condition2Enabled": false,
+        "condition2Service": "",
+        "condition2Path": "",
+        "condition2Operator": ">",
+        "logicOperator": "AND",
+        "outputTrue": "true",
+        "outputFalse": "false",
+        "outputOnChange": false,
+        "debounce": 2000,
+        "x": 1180,
+        "y": 940,
+        "wires": []
+    },
+    {
+        "id": "4a8e7a1383ada182",
+        "type": "victron-input-custom",
+        "z": "weather_aware_alarm_flow",
+        "outputs": 1,
+        "service": "com.victronenergy.vebus/276",
+        "path": "/Ac/Out/L1/P",
+        "serviceObj": {
+            "service": "com.victronenergy.vebus/276",
+            "name": "MultiPlus (276)"
+        },
+        "pathObj": {
+            "path": "/Ac/Out/L1/P",
+            "name": "/Ac/Out/L1/P",
+            "type": "number",
+            "value": 374
+        },
+        "name": "AC  Load L1",
+        "onlyChanges": false,
+        "roundValues": "no",
+        "rateLimit": 0,
+        "conditionalMode": false,
+        "condition1HysteresisEnabled": false,
+        "condition1HysteresisThreshold": "",
+        "outputTrue": "true",
+        "outputFalse": "false",
+        "debounce": "2000",
+        "x": 450,
+        "y": 840,
+        "wires": [
+            [
+                "smart_hysteresis_logic"
+            ]
+        ]
+    },
+    {
+        "id": "78d010251a69948b",
+        "type": "victron-virtual-switch",
+        "z": "weather_aware_alarm_flow",
+        "name": "",
+        "outputs": 2,
+        "switch_1_type": "1",
+        "switch_1_initial": 0,
+        "switch_1_label": "",
+        "switch_1_customname": "Force Shore Power",
+        "switch_1_group": "Switches",
+        "switch_1_include_measurement": false,
+        "switch_1_rgb_color_wheel": false,
+        "switch_1_cct_wheel": false,
+        "switch_1_rgb_white_dimmer": false,
+        "switch_1_show_ui_input": 1,
+        "switch_1_passthrough_mode": "auto_only",
+        "x": 370,
+        "y": 780,
+        "wires": [
+            [
+                "smart_hysteresis_logic"
+            ],
+            [
+                "smart_hysteresis_logic"
+            ]
+        ]
+    },
+    {
+        "id": "84f2d923c5d0d05d",
+        "type": "victron-input-custom",
+        "z": "weather_aware_alarm_flow",
+        "outputs": 1,
+        "service": "com.victronenergy.vebus/276",
+        "path": "/Alarms/L1/LowBattery",
+        "serviceObj": {
+            "service": "com.victronenergy.vebus/276",
+            "name": "MultiPlus (276)"
+        },
+        "pathObj": {
+            "path": "/Alarms/L1/LowBattery",
+            "name": "/Alarms/L1/LowBattery",
+            "type": "number",
+            "value": 0
+        },
+        "name": "",
+        "onlyChanges": false,
+        "roundValues": "no",
+        "rateLimit": 0,
+        "conditionalMode": false,
+        "condition1HysteresisEnabled": false,
+        "condition1HysteresisThreshold": "",
+        "outputTrue": "true",
+        "outputFalse": "false",
+        "debounce": "2000",
+        "x": 390,
+        "y": 1020,
+        "wires": [
+            [
+                "d86f52b9eb0ed382"
+            ]
+        ]
+    },
+    {
+        "id": "d86f52b9eb0ed382",
+        "type": "function",
+        "z": "weather_aware_alarm_flow",
+        "name": "Parse Hardware Faults",
+        "func": "// Initialize local tracking variables\nlet lowBatteryAlarm = msg.payload; \nlet faultState = 0;\nlet statusMessage = \"System Status Normal\";\nlet statusColor = \"green\";\n\n// Evaluate the incoming Victron Low Battery Alarm binary state\nif (lowBatteryAlarm === 1 || lowBatteryAlarm === true) {\n    faultState = 1;\n    statusMessage = \"WARNING: Battery Voltage Sagging Under Load!\";\n    statusColor = \"red\";\n} else {\n    faultState = 0;\n    statusMessage = \"System Status Normal\";\n    statusColor = \"green\";\n}\n\n// Display the text beautifully right under the node box on your workspace canvas\nnode.status({ fill: statusColor, shape: \"dot\", text: statusMessage });\n\n// Send ONLY a clean raw number down the wire to the rigid Victron hardware node\nmsg.payload = faultState;\nreturn msg;\n",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 920,
+        "y": 1020,
+        "wires": [
+            [
+                "ea020f9d09a55a1a"
+            ]
+        ]
+    },
+    {
+        "id": "f45fbc6e8f161bce",
+        "type": "victron-output-switch",
+        "z": "weather_aware_alarm_flow",
+        "outputs": 0,
+        "service": "com.victronenergy.switch/101",
+        "path": "/SwitchableOutput/output_1/State",
+        "serviceObj": {
+            "service": "com.victronenergy.switch/101",
+            "name": "Virtual switch",
+            "communityTag": "switch"
+        },
+        "pathObj": {
+            "path": "/SwitchableOutput/output_1/State",
+            "type": "enum",
+            "enum": {
+                "0": "Off",
+                "1": "On"
+            },
+            "name": "Force Shore Power state",
+            "mode": "both"
+        },
+        "name": "",
+        "onlyChanges": false,
+        "roundValues": "no",
+        "rateLimit": 0,
+        "conditionalMode": false,
+        "condition1Operator": ">",
+        "condition1HysteresisEnabled": false,
+        "condition1HysteresisThreshold": "",
+        "condition2Enabled": false,
+        "condition2Service": "",
+        "condition2Path": "",
+        "condition2Operator": ">",
+        "logicOperator": "AND",
+        "outputTrue": "true",
+        "outputFalse": "false",
+        "outputOnChange": false,
+        "debounce": 2000,
+        "x": 1300,
+        "y": 800,
+        "wires": []
+    },
+    {
+        "id": "33f96873dd8da461",
+        "type": "victron-input-solarcharger",
+        "z": "weather_aware_alarm_flow",
+        "outputs": 1,
+        "service": "com.victronenergy.solarcharger/0",
+        "path": "/Yield/Power",
+        "serviceObj": {
+            "service": "com.victronenergy.solarcharger/0",
+            "name": "Ground Array",
+            "communityTag": "solarcharger"
+        },
+        "pathObj": {
+            "path": "/Yield/Power",
+            "type": "float",
+            "name": "PV Power (W)"
+        },
+        "name": "Ground Array",
+        "onlyChanges": false,
+        "roundValues": "no",
+        "rateLimit": 0,
+        "conditionalMode": false,
+        "condition1HysteresisEnabled": false,
+        "condition1HysteresisThreshold": "",
+        "outputTrue": "true",
+        "outputFalse": "false",
+        "debounce": "2000",
+        "x": 470,
+        "y": 640,
+        "wires": [
+            [
+                "smart_hysteresis_logic"
+            ]
+        ]
+    },
+    {
+        "id": "9115ff1477cff1c7",
+        "type": "victron-input-solarcharger",
+        "z": "weather_aware_alarm_flow",
+        "outputs": 1,
+        "service": "com.victronenergy.solarcharger/278",
+        "path": "/Yield/Power",
+        "serviceObj": {
+            "service": "com.victronenergy.solarcharger/278",
+            "name": "Roof",
+            "communityTag": "solarcharger"
+        },
+        "pathObj": {
+            "path": "/Yield/Power",
+            "type": "float",
+            "name": "PV Power (W)"
+        },
+        "name": "Roof",
+        "onlyChanges": false,
+        "roundValues": "no",
+        "rateLimit": 0,
+        "conditionalMode": false,
+        "condition1HysteresisEnabled": false,
+        "condition1HysteresisThreshold": "",
+        "outputTrue": "true",
+        "outputFalse": "false",
+        "debounce": "2000",
+        "x": 470,
+        "y": 720,
+        "wires": [
+            [
+                "smart_hysteresis_logic"
+            ]
+        ]
+    },
+    {
+        "id": "morning_timer",
+        "type": "inject",
+        "z": "weather_api_subflow",
+        "name": "30 Minute check",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "crontab": "*/30 6-20 * * *",
+        "once": true,
+        "onceDelay": "5",
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 140,
+        "y": 120,
+        "wires": [
+            [
+                "weather_api_node"
+            ]
+        ]
+    },
+    {
+        "id": "weather_api_node",
+        "type": "openweathermap",
+        "z": "weather_api_subflow",
+        "name": "Fetch Forecast",
+        "wtype": "current",
+        "lon": "",
+        "lat": "",
+        "city": "",
+        "country": "",
+        "language": "en",
+        "x": 380,
+        "y": 120,
+        "wires": [
+            [
+                "weather_translator"
+            ]
+        ]
+    },
+    {
+        "id": "weather_translator",
+        "type": "function",
+        "z": "weather_api_subflow",
+        "name": "Calculate Dynamic Floor",
+        "func": "let dateObj = new Date();\nlet currentHour = dateObj.getHours();\n\n// ==========================================\n// DAYLIGHT GATEKEEPER RULE\n// ==========================================\n// In Tennessee, winter sun rises around 7:15 AM and sets as early as 4:45 PM. \n// Summer sun rises around 5:30 AM and sets around 8:15 PM.\nlet isNighttime = false;\n\n// Fetch the astronomical sunset time from background memory if available\nlet actualSunsetTime = global.get(\"actualSunsetTime\") || 0;\n\nif (actualSunsetTime > 0) {\n    let sunsetHourObj = new Date(actualSunsetTime).getHours();\n    // It's night if it's past sunset or before early morning twilight (6:00 AM)\n    if (currentHour >= sunsetHourObj || currentHour < 6) {\n        isNighttime = true;\n    }\n} else {\n    // FALLBACK: If the API hasn't given us a timestamp yet, use standard seasonal hours\n    let currentMonth = dateObj.getMonth(); // 0 = Jan, 9 = Oct\n    let typicalWinterSunset = 17; // 5:00 PM\n    let typicalSummerSunset = 20; // 8:00 PM\n    \n    let activeSunsetCeiling = (currentMonth >= 9 || currentMonth <= 1) ? typicalWinterSunset : typicalSummerSunset;\n    \n    if (currentHour >= activeSunsetCeiling || currentHour < 6) {\n        isNighttime = true;\n    }\n}\n\n// IF IT IS NIGHTTIME: Terminate immediately. Do not query the API or change daytime math.\nif (isNighttime) {\n    node.status({ \n        fill: \"black\", \n        shape: \"ring\", \n        text: \"Night Mode Idle (API Asleep) | Hour: \" + currentHour + \":00\" \n    });\n    return null; \n}\n\n// ==========================================\n// ACTIVE DAYLIGHT SOLAR LOGIC (Only runs when sun is up)\n// ==========================================\nlet weatherCondition = \"Clear\";\nlet cloudCover = 0;\nlet sunsetTimestamp = 0;\n\nif (msg && msg.payload) {\n    if (msg.payload.weather && msg.payload.weather) {\n        weatherCondition = msg.payload.weather.main;\n    }\n    if (msg.payload.clouds && msg.payload.clouds.all !== undefined) {\n        cloudCover = msg.payload.clouds.all;\n    }\n    if (msg.payload.sys && msg.payload.sys.sunset) {\n        sunsetTimestamp = msg.payload.sys.sunset * 1000;\n    }\n}\n\nlet now = Date.now();\nlet recommendedFloor = 20; // Default sunny day rule\n\n// 1. BASELINE WEATHER REGULATION\nif (weatherCondition === \"Rain\" || weatherCondition === \"Thunderstorm\" || weatherCondition === \"Snow\" || weatherCondition === \"Drizzle\") {\n    recommendedFloor = 60; \n} else if (weatherCondition === \"Clouds\" || cloudCover > 50) {\n    recommendedFloor = 40; \n}\n\n// 2. SUNSET PROXIMITY BUFFERS\nlet sunsetDateText = \"Unknown\";\nif (sunsetTimestamp > 0) {\n    let hoursUntilSunset = (sunsetTimestamp - now) / (1000 * 60 * 60);\n    sunsetDateText = new Date(sunsetTimestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});\n\n    if (hoursUntilSunset <= 3 && hoursUntilSunset > 0 && cloudCover >= 75) {\n        recommendedFloor = Math.max(recommendedFloor, 60); // Protect against empty-tank sunset storm\n    } else if (hoursUntilSunset <= 2 && hoursUntilSunset > 0) {\n        recommendedFloor = Math.max(recommendedFloor, 35); // General secure night floor\n    }\n} else {\n    sunsetDateText = \"Pending API\";\n}\n\n// Save variables out to global storage\nglobal.set(\"dynamicLowerSoC\", recommendedFloor);\nglobal.set(\"actualSunsetTime\", sunsetTimestamp);\n\n// Display active daylight tracking status\nnode.status({ \n    fill: \"blue\", \n    shape: \"dot\", \n    text: \"Sunset: \" + sunsetDateText + \" | Target Floor: \" + recommendedFloor + \"%\" \n});\n\nreturn msg;\n",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 630,
+        "y": 120,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "fbc396106c24ef2d",
+        "type": "global-config",
+        "env": [],
+        "modules": {
+            "@victronenergy/node-red-contrib-victron": "1.7.27",
+            "node-red-node-openweathermap": "1.0.1"
+        }
+    }
+]
