@@ -91,7 +91,7 @@
         "type": "function",
         "z": "weather_aware_alarm_flow",
         "name": "Advanced Logic & Alarms",
-        "func": "// ==========================================\n// 1. INITIALIZE SYSTEM MEMORY\n// ==========================================\nlet currentMode = context.get('currentMode') || 0; \nlet soc = context.get('soc') || 100;\nlet voltage = context.get('voltage') || 26.4;\nlet acLoad = context.get('acLoad') || 0;\nlet manualOverride = context.get('manualOverride') || 0;\nlet isWeatherBad = context.get('isWeatherBad') || false;\n\n// Track both solar arrays independently in local memory slots\nlet solarWatts1 = context.get('solarWatts1') || 0;\nlet solarWatts2 = context.get('solarWatts2') || 0;\n\n// ==========================================\n// 2. PARSE INCOMING DATA PIPELINES (VIC-AWARE)\n// ==========================================\nif (msg.topic) {\n    let lowerTopic = msg.topic.toLowerCase();\n    \n    if (lowerTopic.includes(\"soc\")) {\n        soc = Number(msg.payload);\n        context.set('soc', soc);\n    }\n    if (lowerTopic.includes(\"voltage\")) {\n        voltage = Number(msg.payload);\n        context.set('voltage', voltage);\n    }\n    if (lowerTopic.includes(\"ac/acout/l1/p\") || lowerTopic.includes(\"consumption\")) {\n        acLoad = Number(msg.payload);\n        context.set('acLoad', acLoad);\n    }\n    if (lowerTopic.includes(\"weather\") || lowerTopic.includes(\"cloud\") || lowerTopic.includes(\"forecast\")) {\n        if (msg.payload === \"Overcast\" || msg.payload === \"Rain\" || msg.payload > 70) { isWeatherBad = true; } \n        else { isWeatherBad = false; }\n        context.set('isWeatherBad', isWeatherBad);\n    }\n\n    // MATCH VIC-SYSTEM SOLAR CHARGERS AUTOMATIC TOPICS:\n    if (lowerTopic.includes(\"solarcharger\")) {\n        if (lowerTopic.includes(\"/0/\") || lowerTopic.includes(\"solarcharger_0\") || lowerTopic.includes(\"instance0\")) {\n            solarWatts1 = Number(msg.payload);\n            context.set('solarWatts1', solarWatts1);\n        } else {\n            solarWatts2 = Number(msg.payload);\n            context.set('solarWatts2', solarWatts2);\n        }\n    }\n}\n\n// Intercept raw switch wire movements from your Venus toggle\nif (!msg.topic || msg.topic === \"\") {\n    if (msg.payload === 1 || msg.payload === true || msg.payload === 101) { manualOverride = 1; }\n    else if (msg.payload === 0 || msg.payload === false) { manualOverride = 0; }\n    context.set('manualOverride', manualOverride);\n}\n\n// Math Aggregator: Calculate total generation and net energy balance\nlet totalSolarWatts = solarWatts1 + solarWatts2;\nlet netSolarBalance = totalSolarWatts - acLoad;\n\nlet dynamicLowerSoC = global.get(\"dynamicLowerSoC\") || 20;\nlet targetMode = currentMode; \n\n// ==========================================\n// 3. TARGET STATE CALCULATOR (Solar Watts vs Load Watts)\n// ==========================================\nif (manualOverride === 1) {\n    targetMode = 0; // Manual Overwrite ON -> Force Grid Connect Immediately\n    context.set('lastSentPayload', null); \n} else if (acLoad >= 1200) {\n    targetMode = 0; // Hard load safety ceiling -> Use Grid to protect inverter components\n} else {\n    // 1. CRITICAL BATTERY FLOOR PROTECTION\n    if (soc <= dynamicLowerSoC || voltage <= 23.8) {\n        targetMode = 0; \n    } \n    \n    // 2. CONDITIONAL SOLAR PRIORITY RUN ENGAGEMENT\n    else if (isWeatherBad === false && soc >= (dynamicLowerSoC + 4) && voltage > 24.5 && netSolarBalance >= 50) {\n        targetMode = 1; // Verified net energy surplus -> Safe to run Solar Run\n    } \n    \n    // 3. REAL-TIME DEFICIT DRIFT FALLBACK (The Net Energy Monitor)\n    else if (isWeatherBad === true || (netSolarBalance < -200 && soc < 50)) {\n        targetMode = 0; // House load out-paces solar -> Reconnect Grid cleanly\n    } \n    \n    // 4. BUFFER STATE HYSTERESIS HOLD\n    else {\n        targetMode = currentMode; \n    }\n}\n\n// ==========================================\n// 4. FORCE SHORE POWER HARDWARE CONTROL GATE\n// ==========================================\nlet lastSentPayload = context.get('lastSentPayload');\n\n// NATIVE SYSTEM REGISTERS FOR BLUE HARDWARE NODES:\n// 1 = True (Force the hardware to turn ON Shore Power Connect / Start Charging)\n// 0 = False (Turn OFF Force Shore Power / Release control back to Solar priority)\nlet outputPayload = (targetMode === 0) ? 1 : 0; \n\nif (outputPayload === lastSentPayload) {\n    return [null, null]; // Suppress duplicate loops\n}\n\ncontext.set('lastSentPayload', outputPayload);\ncurrentMode = targetMode;\ncontext.set('currentMode', currentMode);\n\nmsgMode = { payload: outputPayload, topic: \"Force Shore Control\" };\nmsgAlarm = { payload: (outputPayload === 1) ? 1 : 0 }; \n\nreturn [msgMode, msgAlarm];\n",
+        "func": "// ==========================================\n// USER SETTINGS\n// ==========================================\n\n// Battery bank\nconst BATTERY_WH = 2400;\n\n// Typical overnight draw\nconst NIGHT_LOAD_W = 200;\n\n// Inverter protection\nconst HARD_LOAD_LIMIT = 1200;\nconst HIGH_LOAD_LIMIT = 900;\n\n// Solar requirements\nconst REQUIRED_SOLAR_MARGIN = 300;\n\n// Battery protection\nconst LOW_VOLTAGE_LIMIT = 23.8;\n\n// Require battery charging or nearly neutral\nconst BATTERY_POWER_THRESHOLD = 0;\n\n// Sunset reserve\nconst SUNSET_SOC_THRESHOLD = 30;\n\n// Sunrise fallback\nconst SUNRISE_FALLBACK_HOURS = 16;\n\n// ==========================================\n// STATE VARIABLES\n// ==========================================\n\nlet currentMode =\n    context.get(\"currentMode\") || 0;\n\nlet soc =\n    context.get(\"soc\") || 100;\n\nlet voltage =\n    context.get(\"voltage\") || 26.4;\n\nlet acLoad =\n    context.get(\"acLoad\") || 0;\n\nlet batteryPower =\n    context.get(\"batteryPower\") || 0;\n\nlet manualOverride =\n    context.get(\"manualOverride\") || 0;\n\nlet solarWatts1 =\n    context.get(\"solarWatts1\") || 0;\n\nlet solarWatts2 =\n    context.get(\"solarWatts2\") || 0;\n\n// ==========================================\n// INPUT PROCESSING\n// ==========================================\n\nif (msg.topic) {\n\n    let topic =\n        msg.topic.toLowerCase();\n\n    if (topic.includes(\"soc\")) {\n\n        soc = Number(msg.payload);\n\n        context.set(\n            \"soc\",\n            soc\n        );\n    }\n\n    if (topic.includes(\"voltage\")) {\n\n        voltage =\n            Number(msg.payload);\n\n        context.set(\n            \"voltage\",\n            voltage\n        );\n    }\n\n    if (\n        topic.includes(\"ac/out/l1/p\") ||\n        topic.includes(\"ac/acout/l1/p\") ||\n        topic.includes(\"consumption\")\n    ) {\n\n        acLoad =\n            Number(msg.payload);\n\n        context.set(\n            \"acLoad\",\n            acLoad\n        );\n    }\n\n    if (\n        topic.includes(\"dc/0/power\")\n    ) {\n\n        batteryPower =\n            Number(msg.payload);\n\n        context.set(\n            \"batteryPower\",\n            batteryPower\n        );\n    }\n\n    if (\n        topic.includes(\"solarcharger\")\n    ) {\n\n        if (\n            topic.includes(\"/0/\") ||\n            topic.includes(\"instance0\")\n        ) {\n\n            solarWatts1 =\n                Number(msg.payload);\n\n            context.set(\n                \"solarWatts1\",\n                solarWatts1\n            );\n\n        } else {\n\n            solarWatts2 =\n                Number(msg.payload);\n\n            context.set(\n                \"solarWatts2\",\n                solarWatts2\n            );\n        }\n    }\n}\n\n// ==========================================\n// MANUAL OVERRIDE\n// ==========================================\n\nif (!msg.topic) {\n\n    if (\n        msg.payload === true ||\n        msg.payload === 1 ||\n        msg.payload === 101\n    ) {\n\n        manualOverride = 1;\n\n    } else {\n\n        manualOverride = 0;\n    }\n\n    context.set(\n        \"manualOverride\",\n        manualOverride\n    );\n}\n\n// ==========================================\n// LIVE SYSTEM TOTALS\n// ==========================================\n\nlet totalSolar =\n    solarWatts1 +\n    solarWatts2;\n\nlet solarMargin =\n    totalSolar -\n    acLoad;\n\n// ==========================================\n// WEATHER VARIABLES\n// ==========================================\n\nlet dynamicFloor =\n    global.get(\n        \"dynamicLowerSoC\"\n    ) || 20;\n\nlet forecastClouds =\n    global.get(\n        \"forecastClouds\"\n    ) || 0;\n\nlet forecastRain =\n    global.get(\n        \"forecastRain\"\n    ) || false;\n\nlet severeWeather =\n    global.get(\n        \"severeWeather\"\n    ) || false;\n\nlet sunriseTime =\n    global.get(\n        \"actualSunriseTime\"\n    ) || 0;\n\nlet sunsetTime =\n    global.get(\n        \"actualSunsetTime\"\n    ) || 0;\n\n// ==========================================\n// ENERGY PLANNING\n// ==========================================\n\nlet now = Date.now();\n\nlet nextSunrise =\n    sunriseTime;\n\n// if today's sunrise has already passed\n// estimate tomorrow morning\n\nif (\n    nextSunrise <= now ||\n    nextSunrise === 0\n) {\n\n    nextSunrise =\n        now +\n        (\n            SUNRISE_FALLBACK_HOURS *\n            3600000\n        );\n}\n\nlet hoursToSunrise =\n    (\n        nextSunrise -\n        now\n    ) / 3600000;\n\nlet usableWh =\n    BATTERY_WH *\n    Math.max(\n        0,\n        (\n            soc - 20\n        ) / 100\n    );\n\nlet overnightNeedWh =\n    NIGHT_LOAD_W *\n    hoursToSunrise;\n\nlet reserveRequired =\n    overnightNeedWh * 1.20;\n\nlet hoursToSunset = 99;\n\nif (\n    sunsetTime > now\n) {\n\n    hoursToSunset =\n        (\n            sunsetTime -\n            now\n        ) / 3600000;\n}\n\n// ==========================================\n// DECISION ENGINE\n// ==========================================\n\nlet targetMode =\n    currentMode;\n\n/*\n0 = Shore/Grid\n\n1 = Solar\n*/\n\n// Manual override\n\nif (\n    manualOverride === 1\n) {\n\n    targetMode = 0;\n\n}\n\n// Severe weather reserve mode\n\nelse if (\n    severeWeather\n) {\n\n    targetMode = 0;\n\n}\n\n// Inverter protection\n\nelse if (\n    acLoad >= HARD_LOAD_LIMIT\n) {\n\n    targetMode = 0;\n\n}\n\n// Heavy loads without enough solar\n\nelse if (\n    acLoad >= HIGH_LOAD_LIMIT &&\n    totalSolar <\n        (\n            acLoad +\n            REQUIRED_SOLAR_MARGIN\n        )\n) {\n\n    targetMode = 0;\n\n}\n\n// Battery reserve reached\n\nelse if (\n    soc <= dynamicFloor\n) {\n\n    targetMode = 0;\n\n}\n\n// Voltage emergency\n\nelse if (\n    voltage <= LOW_VOLTAGE_LIMIT\n) {\n\n    targetMode = 0;\n\n}\n\n// Cannot survive until sunrise\n\nelse if (\n    usableWh <\n    reserveRequired\n) {\n\n    targetMode = 0;\n\n}\n\n// Rain forecast\n\nelse if (\n    forecastRain &&\n    soc < (dynamicFloor + 5)\n) {\n\n    targetMode = 0;\n\n}\n\n// Severe weather\n\nelse if (\n    severeWeather\n) {\n\n    targetMode = 0;\n\n}\n\n// Near sunset\n\nelse if (\n    hoursToSunset < 2 &&\n    soc < SUNSET_SOC_THRESHOLD\n) {\n\n    targetMode = 0;\n\n}\n\n// Very poor solar outlook\n\nelse if (\n    forecastClouds > 85 &&\n    soc < 60\n) {\n\n    targetMode = 0;\n\n}\n\n// Solar mode allowed\n\nelse if (\n\n    solarMargin >\n        REQUIRED_SOLAR_MARGIN &&\n\n    soc >\n        (\n            dynamicFloor +\n            5\n        ) &&\n\n    forecastClouds < 75 &&\n\n    batteryPower >\n        BATTERY_POWER_THRESHOLD\n\n) {\n\n    targetMode = 1;\n\n}\n\n// Hold previous state\n\nelse {\n\n    targetMode =\n        currentMode;\n}\n\n// ==========================================\n// OUTPUT GATE\n// ==========================================\n\nlet lastSentPayload =\n    context.get(\n        \"lastSentPayload\"\n    );\n\nlet outputPayload =\n    (\n        targetMode === 0\n    )\n        ? 1\n        : 0;\n\nif (\n    outputPayload ===\n    lastSentPayload\n) {\n\n    return [\n        null,\n        null,\n        null\n    ];\n}\n\ncontext.set(\n    \"lastSentPayload\",\n    outputPayload\n);\n\ncontext.set(\n    \"currentMode\",\n    targetMode\n);\n\n// ==========================================\n// STATUS\n// ==========================================\n\nnode.status({\n\n    fill:\n        targetMode === 1\n            ? \"green\"\n            : \"yellow\",\n\n    shape: \"dot\",\n\n    text:\n        \"SOC \" +\n        soc.toFixed(0) +\n        \"% PV \" +\n        totalSolar +\n        \"W Load \" +\n        acLoad +\n        \"W Batt \" +\n        batteryPower +\n        \"W Floor \" +\n        dynamicFloor +\n        \"%\" +\n        (\n            severeWeather\n                ? \" STORM\"\n                : \"\"\n        )\n});\n\n// ==========================================\n// OUTPUTS\n// ==========================================\n\nlet msgMode = {\n\n    payload:\n        outputPayload,\n\n    topic:\n        \"Force Shore Control\"\n};\n\nlet msgAlarm = {\n\n    payload:\n        outputPayload === 1\n            ? 1\n            : 0\n};\n\nreturn [\n    msgMode,\n    msgAlarm,\n    null\n];",
         "outputs": 3,
         "timeout": "",
         "noerr": 0,
@@ -121,8 +121,8 @@
         "inout": "out",
         "property": "payload",
         "topi": "topic",
-        "x": 950,
-        "y": 960,
+        "x": 1010,
+        "y": 940,
         "wires": [
             [
                 "ea020f9d09a55a1a"
@@ -163,7 +163,7 @@
         "outputFalse": "false",
         "outputOnChange": false,
         "debounce": 2000,
-        "x": 1180,
+        "x": 1220,
         "y": 940,
         "wires": []
     },
@@ -399,6 +399,41 @@
         ]
     },
     {
+        "id": "c00b73c950cca1fb",
+        "type": "victron-input-custom",
+        "z": "weather_aware_alarm_flow",
+        "outputs": 1,
+        "service": "com.victronenergy.battery/277",
+        "path": "/Dc/0/Power",
+        "serviceObj": {
+            "service": "com.victronenergy.battery/277",
+            "name": "BMV-712 Smart (277)"
+        },
+        "pathObj": {
+            "path": "/Dc/0/Power",
+            "name": "/Dc/0/Power",
+            "type": "number",
+            "value": -106
+        },
+        "name": "",
+        "onlyChanges": false,
+        "roundValues": "no",
+        "rateLimit": 0,
+        "conditionalMode": false,
+        "condition1HysteresisEnabled": false,
+        "condition1HysteresisThreshold": "",
+        "outputTrue": "true",
+        "outputFalse": "false",
+        "debounce": "2000",
+        "x": 400,
+        "y": 580,
+        "wires": [
+            [
+                "smart_hysteresis_logic"
+            ]
+        ]
+    },
+    {
         "id": "morning_timer",
         "type": "inject",
         "z": "weather_api_subflow",
@@ -408,8 +443,8 @@
                 "p": "payload"
             }
         ],
-        "repeat": "",
-        "crontab": "*/30 6-20 * * *",
+        "repeat": "1800",
+        "crontab": "",
         "once": true,
         "onceDelay": "5",
         "topic": "",
@@ -428,7 +463,7 @@
         "type": "openweathermap",
         "z": "weather_api_subflow",
         "name": "Fetch Forecast",
-        "wtype": "current",
+        "wtype": "forecast",
         "lon": "",
         "lat": "",
         "city": "",
@@ -447,21 +482,83 @@
         "type": "function",
         "z": "weather_api_subflow",
         "name": "Calculate Dynamic Floor",
-        "func": "let dateObj = new Date();\nlet currentHour = dateObj.getHours();\n\n// ==========================================\n// DAYLIGHT GATEKEEPER RULE\n// ==========================================\n// In Tennessee, winter sun rises around 7:15 AM and sets as early as 4:45 PM. \n// Summer sun rises around 5:30 AM and sets around 8:15 PM.\nlet isNighttime = false;\n\n// Fetch the astronomical sunset time from background memory if available\nlet actualSunsetTime = global.get(\"actualSunsetTime\") || 0;\n\nif (actualSunsetTime > 0) {\n    let sunsetHourObj = new Date(actualSunsetTime).getHours();\n    // It's night if it's past sunset or before early morning twilight (6:00 AM)\n    if (currentHour >= sunsetHourObj || currentHour < 6) {\n        isNighttime = true;\n    }\n} else {\n    // FALLBACK: If the API hasn't given us a timestamp yet, use standard seasonal hours\n    let currentMonth = dateObj.getMonth(); // 0 = Jan, 9 = Oct\n    let typicalWinterSunset = 17; // 5:00 PM\n    let typicalSummerSunset = 20; // 8:00 PM\n    \n    let activeSunsetCeiling = (currentMonth >= 9 || currentMonth <= 1) ? typicalWinterSunset : typicalSummerSunset;\n    \n    if (currentHour >= activeSunsetCeiling || currentHour < 6) {\n        isNighttime = true;\n    }\n}\n\n// IF IT IS NIGHTTIME: Terminate immediately. Do not query the API or change daytime math.\nif (isNighttime) {\n    node.status({ \n        fill: \"black\", \n        shape: \"ring\", \n        text: \"Night Mode Idle (API Asleep) | Hour: \" + currentHour + \":00\" \n    });\n    return null; \n}\n\n// ==========================================\n// ACTIVE DAYLIGHT SOLAR LOGIC (Only runs when sun is up)\n// ==========================================\nlet weatherCondition = \"Clear\";\nlet cloudCover = 0;\nlet sunsetTimestamp = 0;\n\nif (msg && msg.payload) {\n    if (msg.payload.weather && msg.payload.weather) {\n        weatherCondition = msg.payload.weather.main;\n    }\n    if (msg.payload.clouds && msg.payload.clouds.all !== undefined) {\n        cloudCover = msg.payload.clouds.all;\n    }\n    if (msg.payload.sys && msg.payload.sys.sunset) {\n        sunsetTimestamp = msg.payload.sys.sunset * 1000;\n    }\n}\n\nlet now = Date.now();\nlet recommendedFloor = 20; // Default sunny day rule\n\n// 1. BASELINE WEATHER REGULATION\nif (weatherCondition === \"Rain\" || weatherCondition === \"Thunderstorm\" || weatherCondition === \"Snow\" || weatherCondition === \"Drizzle\") {\n    recommendedFloor = 60; \n} else if (weatherCondition === \"Clouds\" || cloudCover > 50) {\n    recommendedFloor = 40; \n}\n\n// 2. SUNSET PROXIMITY BUFFERS\nlet sunsetDateText = \"Unknown\";\nif (sunsetTimestamp > 0) {\n    let hoursUntilSunset = (sunsetTimestamp - now) / (1000 * 60 * 60);\n    sunsetDateText = new Date(sunsetTimestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});\n\n    if (hoursUntilSunset <= 3 && hoursUntilSunset > 0 && cloudCover >= 75) {\n        recommendedFloor = Math.max(recommendedFloor, 60); // Protect against empty-tank sunset storm\n    } else if (hoursUntilSunset <= 2 && hoursUntilSunset > 0) {\n        recommendedFloor = Math.max(recommendedFloor, 35); // General secure night floor\n    }\n} else {\n    sunsetDateText = \"Pending API\";\n}\n\n// Save variables out to global storage\nglobal.set(\"dynamicLowerSoC\", recommendedFloor);\nglobal.set(\"actualSunsetTime\", sunsetTimestamp);\n\n// Display active daylight tracking status\nnode.status({ \n    fill: \"blue\", \n    shape: \"dot\", \n    text: \"Sunset: \" + sunsetDateText + \" | Target Floor: \" + recommendedFloor + \"%\" \n});\n\nreturn msg;\n",
+        "func": "// ==========================================\n// USER SETTINGS\n// ==========================================\n\n// Base battery reserve\nconst SUNNY_FLOOR = 20;\n\n// Weather reserve floors\nconst PARTLY_CLOUDY_FLOOR = 40;\nconst CLOUDY_FLOOR = 50;\nconst VERY_CLOUDY_FLOOR = 60;\nconst RAIN_FLOOR = 70;\nconst EXTENDED_BAD_WEATHER_FLOOR = 85;\n\n// Cloud thresholds\nconst PARTLY_CLOUDY_THRESHOLD = 35;\nconst CLOUDY_THRESHOLD = 65;\nconst VERY_CLOUDY_THRESHOLD = 85;\n\n// Rain threshold\nconst RAIN_CHANCE_THRESHOLD = 50;\n\n// Forecast periods to evaluate\n// 8 periods = ~24 hours\nconst FORECAST_PERIODS = 8;\n\n// Sunset protection\nconst SUNSET_BUFFER_HOURS = 4;\nconst SUNSET_CRITICAL_HOURS = 2;\n\n// Severe weather reserve\nconst STORM_FLOOR = 100;\n\n// Wind thresholds (mph)\nconst HIGH_WIND_MPH = 40;\nconst SEVERE_WIND_MPH = 55;\n\n// Snow thresholds\nconst HEAVY_SNOW_INCHES = 4;\n\n// Ice threshold\nconst ICE_THRESHOLD = 0.10;\n\n// ==========================================\n// START\n// ==========================================\n\nlet forecast = msg.payload || [];\n\nlet worstClouds = 0;\nlet rainChance = 0;\nlet rainExpected = false;\nlet severeWeather = false;\nlet badPeriods = 0;\nlet stormReason = \"\";\n\n// Sunrise/Sunset values supplied by\n// current weather node\n\nlet sunriseTime =\n    global.get(\"actualSunriseTime\") || 0;\n\nlet sunsetTime =\n    global.get(\"actualSunsetTime\") || 0;\n\n// ==========================================\n// FORECAST ANALYSIS\n// ==========================================\n\nlet sampleCount =\n    Math.min(\n        FORECAST_PERIODS,\n        forecast.length\n    );\n\nfor (let i = 0; i < sampleCount; i++) {\n\n    let item = forecast[i];\n\n    let clouds = 0;\n\n    // ----------------------------------\n    // CLOUD COVER\n    // ----------------------------------\n\n    if (\n        item.clouds &&\n        item.clouds.all !== undefined\n    ) {\n\n        clouds =\n            Number(item.clouds.all);\n\n        worstClouds = Math.max(\n            worstClouds,\n            clouds\n        );\n    }\n\n    // ----------------------------------\n    // RAIN CHANCE\n    // ----------------------------------\n\n    if (\n        item.pop !== undefined\n    ) {\n\n        let thisPop =\n            Number(item.pop) * 100;\n\n        rainChance = Math.max(\n            rainChance,\n            thisPop\n        );\n\n        if (\n            thisPop >=\n            RAIN_CHANCE_THRESHOLD\n        ) {\n\n            badPeriods++;\n        }\n    }\n\n    // ----------------------------------\n    // VERY CLOUDY PERIODS\n    // ----------------------------------\n\n    if (\n        clouds >=\n        VERY_CLOUDY_THRESHOLD\n    ) {\n\n        badPeriods++;\n    }\n\n    // ----------------------------------\n    // WEATHER CONDITIONS\n    // ----------------------------------\n\n    if (\n        item.weather &&\n        item.weather.length > 0\n    ) {\n\n        let condition =\n            item.weather[0].main;\n\n        let description =\n            (\n                item.weather[0].description || \"\"\n            ).toLowerCase();\n\n        if (\n            condition === \"Rain\" ||\n            condition === \"Drizzle\" ||\n            condition === \"Thunderstorm\" ||\n            condition === \"Snow\"\n        ) {\n\n            rainExpected = true;\n        }\n\n        // Severe Weather Detection\n\n        if (\n            description.includes(\"tornado\") ||\n            description.includes(\"hurricane\") ||\n            description.includes(\"blizzard\") ||\n            description.includes(\"ice\") ||\n            description.includes(\"ice storm\") ||\n            description.includes(\"freezing\") ||\n            description.includes(\"freezing rain\") ||\n            description.includes(\"heavy snow\") ||\n            description.includes(\"winter storm\") ||\n            description.includes(\"damaging wind\") ||\n            description.includes(\"high wind\") ||\n            description.includes(\"wind advisory\") ||\n            description.includes(\"wind warning\") ||\n            description.includes(\"severe\") ||\n            description.includes(\"strong thunderstorm\") ||\n            description.includes(\"violent storm\")\n        ) {\n        \n            severeWeather = true;\n            stormReason = description;\n        }\n        \n        if (\n            condition === \"Thunderstorm\"\n        ) {\n        \n            severeWeather = true;\n        \n            if (stormReason === \"\") {\n                stormReason = \"thunderstorm\";\n                }\n            }\n        }\n        \n    // ----------------------------------\n    // WIND ANALYSIS\n    // ----------------------------------\n\n    if (\n        item.wind &&\n        item.wind.speed !== undefined\n    ) {\n\n        let windMph =\n            Number(item.wind.speed) * 2.237;\n\n        if (\n            windMph >=\n            HIGH_WIND_MPH\n        ) {\n        \n            badPeriods++;\n        }\n        \n        if (\n            windMph >=\n            SEVERE_WIND_MPH\n        ) {\n        \n            severeWeather = true;\n        \n            if (stormReason === \"\") {\n        \n                stormReason =\n                    \"wind \" +\n                    Math.round(windMph) +\n                    \"mph\";\n            }\n        }\n    }\n}\n\n// ==========================================\n// BASE FLOOR SELECTION\n// ==========================================\n\nlet recommendedFloor =\n    SUNNY_FLOOR;\n\nif (\n    severeWeather\n) {\n\n    recommendedFloor =\n        STORM_FLOOR;\n\n}\nelse if (\n    rainExpected ||\n    rainChance >=\n    RAIN_CHANCE_THRESHOLD\n) {\n\n    recommendedFloor =\n        RAIN_FLOOR;\n\n}\nelse if (\n    worstClouds >=\n    VERY_CLOUDY_THRESHOLD\n) {\n\n    recommendedFloor =\n        VERY_CLOUDY_FLOOR;\n\n}\nelse if (\n    worstClouds >=\n    CLOUDY_THRESHOLD\n) {\n\n    recommendedFloor =\n        CLOUDY_FLOOR;\n\n}\nelse if (\n    worstClouds >=\n    PARTLY_CLOUDY_THRESHOLD\n) {\n\n    recommendedFloor =\n        PARTLY_CLOUDY_FLOOR;\n\n}\n\n// ==========================================\n// EXTENDED BAD WEATHER\n// ==========================================\n\nif (\n    !severeWeather &&\n    badPeriods >= 4\n) {\n\n    recommendedFloor =\n        Math.max(\n            recommendedFloor,\n            EXTENDED_BAD_WEATHER_FLOOR\n        );\n}\n\n// ==========================================\n// SUNSET PROTECTION\n// ==========================================\n\nlet now = Date.now();\n\nlet hoursToSunset = 99;\n\nif (\n    sunsetTime > now\n) {\n\n    hoursToSunset =\n        (\n            sunsetTime -\n            now\n        ) / 3600000;\n}\n\nif (\n    !severeWeather &&\n    hoursToSunset <\n    SUNSET_BUFFER_HOURS\n) {\n\n    recommendedFloor =\n        Math.max(\n            recommendedFloor,\n            CLOUDY_FLOOR\n        );\n}\n\nif (\n    !severeWeather &&\n    hoursToSunset <\n    SUNSET_CRITICAL_HOURS\n) {\n\n    recommendedFloor =\n        Math.max(\n            recommendedFloor,\n            VERY_CLOUDY_FLOOR\n        );\n}\n\n// ==========================================\n// SAVE GLOBALS\n// ==========================================\n\nglobal.set(\n    \"dynamicLowerSoC\",\n    recommendedFloor\n);\n\nglobal.set(\n    \"forecastClouds\",\n    worstClouds\n);\n\nglobal.set(\n    \"forecastRain\",\n    rainExpected\n);\n\nglobal.set(\n    \"rainChance\",\n    rainChance\n);\n\nglobal.set(\n    \"severeWeather\",\n    severeWeather\n);\n\nglobal.set(\n    \"stormReason\",\n    stormReason\n);\n\n// ==========================================\n// STATUS\n// ==========================================\n\nnode.status({\n\n    fill:\n        severeWeather\n            ? \"red\"\n            : \"blue\",\n\n    shape: \"dot\",\n\n    text:\n        severeWeather\n            ? (\n                \"STORM | \" +\n                stormReason +\n                \" | Floor \" +\n                recommendedFloor +\n                \"%\"\n            )\n            : (\n                \"Floor \" +\n                recommendedFloor +\n                \"% | Clouds \" +\n                worstClouds +\n                \"% | Rain \" +\n                Math.round(\n                    rainChance\n                ) +\n                \"%\"\n            )\n\n});\n\nreturn msg;",
         "outputs": 1,
         "timeout": "",
         "noerr": 0,
         "initialize": "",
         "finalize": "",
         "libs": [],
-        "x": 630,
-        "y": 120,
+        "x": 770,
+        "y": 180,
         "wires": [
             []
         ]
     },
     {
-        "id": "fbc396106c24ef2d",
+        "id": "d3d8e7500e6cade3",
+        "type": "inject",
+        "z": "weather_api_subflow",
+        "name": "once a day for sunrise/sunset",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "crontab": "00 05 * * *",
+        "once": true,
+        "onceDelay": "5",
+        "topic": "",
+        "payload": "",
+        "payloadType": "date",
+        "x": 170,
+        "y": 180,
+        "wires": [
+            [
+                "194f89c5d128bb78"
+            ]
+        ]
+    },
+    {
+        "id": "194f89c5d128bb78",
+        "type": "openweathermap",
+        "z": "weather_api_subflow",
+        "name": "Fetch Forecast",
+        "wtype": "current",
+        "lon": "",
+        "lat": "",
+        "city": "",
+        "country": "",
+        "language": "en",
+        "x": 400,
+        "y": 180,
+        "wires": [
+            [
+                "31aafd73ceadabb8"
+            ]
+        ]
+    },
+    {
+        "id": "31aafd73ceadabb8",
+        "type": "function",
+        "z": "weather_api_subflow",
+        "name": "Store 5am sunrise/sunset",
+        "func": "if (\n    msg.payload &&\n    msg.payload.sys\n) {\n\n    if (msg.payload.sys.sunrise) {\n\n        global.set(\n            \"actualSunriseTime\",\n            msg.payload.sys.sunrise * 1000\n        );\n    }\n\n    if (msg.payload.sys.sunset) {\n\n        global.set(\n            \"actualSunsetTime\",\n            msg.payload.sys.sunset * 1000\n        );\n    }\n}\n\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 670,
+        "y": 280,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "2bb85afa46535fef",
         "type": "global-config",
         "env": [],
         "modules": {
